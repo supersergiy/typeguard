@@ -5,6 +5,9 @@ This library adheres to `Semantic Versioning 2.0 <https://semver.org/#semantic-v
 
 **UNRELEASED**
 
+- Added the possibility to emit ``TypeWarning`` instead of raising ``TypeError`` on type violations
+  to the import hook, ``@typechecked``, ``check_argument_types()`` and ``check_return_type()``
+- Added the ``--typeguard-errors`` option to the pytest plugin to emit warnings instead
 - Fixed import errors when using the import hook and trying to import a module that has both a
   module docstring and ``__future__`` imports in it
 - Fixed ``AttributeError`` when using ``@typechecked`` on a metaclass

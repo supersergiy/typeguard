@@ -553,13 +553,16 @@ def check_type(argname: str, value, expected_type, memo: Optional[_CallMemo] = N
         return check_type(argname, value, expected_type.__supertype__, memo)
 
 
-def check_return_type(retval, memo: Optional[_CallMemo] = None) -> bool:
+def check_return_type(retval, memo: Optional[_CallMemo] = None,
+                      emit_warnings: bool = False) -> bool:
     """
     Check that the return value is compatible with the return value annotation in the function.
 
     :param retval: the value about to be returned from the call
+    :param emit_warnings: ``True`` to emit :exc:`~TypeWarning` instead of raising :exc:`~TypeError`
+        when a type violation is encountered
     :return: ``True``
-    :raises TypeError: if there is a type mismatch
+    :raises TypeError: if there is a type mismatch and ``emit_warnings`` is ``False``
 
     """
     if memo is None:
@@ -578,20 +581,25 @@ def check_return_type(retval, memo: Optional[_CallMemo] = None) -> bool:
         try:
             check_type('the return value', retval, memo.type_hints['return'], memo)
         except TypeError as exc:  # suppress unnecessarily long tracebacks
-            raise exc from None
+            if emit_warnings:
+                warn(TypeWarning(memo, 'return', None, exc))
+            else:
+                raise exc from None
 
     return True
 
 
-def check_argument_types(memo: Optional[_CallMemo] = None) -> bool:
+def check_argument_types(memo: Optional[_CallMemo] = None, emit_warnings: bool = False) -> bool:
     """
     Check that the argument values match the annotated types.
 
     Unless both ``args`` and ``kwargs`` are provided, the information will be retrieved from
     the previous stack frame (ie. from the function that called this).
 
+    :param emit_warnings: ``True`` to emit :exc:`~TypeWarning` instead of raising :exc:`~TypeError`
+        when a type violation is encountered
     :return: ``True``
-    :raises TypeError: if there is an argument type mismatch
+    :raises TypeError: if there is an argument type mismatch and ``emit_warnings`` is ``False``
 
     """
     if memo is None:
@@ -613,16 +621,20 @@ def check_argument_types(memo: Optional[_CallMemo] = None) -> bool:
             try:
                 check_type(description, value, expected_type, memo)
             except TypeError as exc:  # suppress unnecessarily long tracebacks
-                raise exc from None
+                if emit_warnings:
+                    warn(TypeWarning(memo, 'call', None, exc))
+                else:
+                    raise exc from None
 
     return True
 
 
-class TypeCheckedGenerator:
-    def __init__(self, wrapped: Generator, memo: _CallMemo):
+class TypeCheckedGenerator(collections.abc.Generator):
+    def __init__(self, wrapped: Generator, memo: _CallMemo, emit_warnings: bool = False):
         rtype_args = memo.type_hints['return'].__args__
         self.__wrapped = wrapped
         self.__memo = memo
+        self.__emit_warnings = emit_warnings
         self.__yield_type = rtype_args[0]
         self.__send_type = rtype_args[1] if len(rtype_args) > 1 else Any
         self.__return_type = rtype_args[2] if len(rtype_args) > 2 else Any
@@ -652,18 +664,33 @@ class TypeCheckedGenerator:
         try:
             value = self.__wrapped.send(obj)
         except StopIteration as exc:
-            check_type('return value', exc.value, self.__return_type, memo=self.__memo)
+            try:
+                check_type('return value', exc.value, self.__return_type, memo=self.__memo)
+            except TypeError as exc:  # suppress unnecessarily long tracebacks
+                if self.__emit_warnings:
+                    warn(TypeWarning(self.__memo, 'yield', None, exc))
+                else:
+                    raise exc from None
+
             raise
 
-        check_type('value yielded from generator', value, self.__yield_type, memo=self.__memo)
+        try:
+            check_type('value yielded from generator', value, self.__yield_type, memo=self.__memo)
+        except TypeError as exc:  # suppress unnecessarily long tracebacks
+            if self.__emit_warnings:
+                warn(TypeWarning(self.__memo, 'yield', None, exc))
+            else:
+                raise exc from None
+
         return value
 
 
 class TypeCheckedAsyncGenerator:
-    def __init__(self, wrapped: AsyncGenerator, memo: _CallMemo):
+    def __init__(self, wrapped: AsyncGenerator, memo: _CallMemo, emit_warnings: bool = False):
         rtype_args = memo.type_hints['return'].__args__
         self.__wrapped = wrapped
         self.__memo = memo
+        self.__emit_warnings = emit_warnings
         self.__yield_type = rtype_args[0]
         self.__send_type = rtype_args[1] if len(rtype_args) > 1 else Any
         self.__initialized = False
@@ -685,26 +712,41 @@ class TypeCheckedAsyncGenerator:
 
     async def asend(self, obj):
         if self.__initialized:
-            check_type('value sent to generator', obj, self.__send_type, memo=self.__memo)
+            try:
+                check_type('value sent to generator', obj, self.__send_type, memo=self.__memo)
+            except TypeError as exc:  # suppress unnecessarily long tracebacks
+                if self.__emit_warnings:
+                    warn(TypeWarning(self.__memo, 'yield', None, exc))
+                else:
+                    raise exc from None
         else:
             self.__initialized = True
 
         value = await self.__wrapped.asend(obj)
-        check_type('value yielded from generator', value, self.__yield_type, memo=self.__memo)
+        try:
+            check_type('value yielded from generator', value, self.__yield_type, memo=self.__memo)
+        except TypeError as exc:  # suppress unnecessarily long tracebacks
+            if self.__emit_warnings:
+                warn(TypeWarning(self.__memo, 'yield', None, exc))
+            else:
+                raise exc from None
+
         return value
 
 
 @overload
-def typechecked(*, always: bool = False) -> Callable[[T_CallableOrType], T_CallableOrType]:
+def typechecked(*, always: bool = False,
+                emit_warnings: bool = False) -> Callable[[T_CallableOrType], T_CallableOrType]:
     ...
 
 
 @overload
-def typechecked(func: T_CallableOrType, *, always: bool = False) -> T_CallableOrType:
+def typechecked(func: T_CallableOrType, *, always: bool = False,
+                emit_warnings: bool = False) -> T_CallableOrType:
     ...
 
 
-def typechecked(func=None, *, always=False):
+def typechecked(func=None, *, always=False, emit_warnings=False):
     """
     Perform runtime type checking on the arguments that are passed to the wrapped function.
 
@@ -718,13 +760,15 @@ def typechecked(func=None, *, always=False):
 
     :param func: the function or class to enable type checking for
     :param always: ``True`` to enable type checks even in optimized mode
+    :param emit_warnings: ``True`` to emit :exc:`~TypeWarning` instead of raising :exc:`~TypeError`
+        when a type violation is encountered
 
     """
     if not __debug__ and not always:  # pragma: no cover
         return func
 
     if func is None:
-        return partial(typechecked, always=always)
+        return partial(typechecked, always=always, emit_warnings=emit_warnings)
 
     if isclass(func):
         prefix = func.__qualname__ + '.'
@@ -732,7 +776,8 @@ def typechecked(func=None, *, always=False):
             attr = getattr(func, key, None)
             if callable(attr) and attr.__qualname__.startswith(prefix):
                 if getattr(attr, '__annotations__', None):
-                    setattr(func, key, typechecked(attr, always=always))
+                    setattr(func, key,
+                            typechecked(attr, always=always, emit_warnings=emit_warnings))
 
         return func
 
@@ -745,26 +790,26 @@ def typechecked(func=None, *, always=False):
 
     def wrapper(*args, **kwargs):
         memo = _CallMemo(python_func, args=args, kwargs=kwargs)
-        check_argument_types(memo)
+        check_argument_types(memo, emit_warnings=emit_warnings)
         retval = func(*args, **kwargs)
-        check_return_type(retval, memo)
+        check_return_type(retval, memo, emit_warnings=emit_warnings)
 
         # If a generator is returned, wrap it if its yield/send/return types can be checked
         if inspect.isgenerator(retval) or isasyncgen(retval):
             return_type = memo.type_hints.get('return')
             origin = getattr(return_type, '__origin__')
             if origin in generator_origin_types:
-                return TypeCheckedGenerator(retval, memo)
+                return TypeCheckedGenerator(retval, memo, emit_warnings=emit_warnings)
             elif origin is not None and origin in asyncgen_origin_types:
-                return TypeCheckedAsyncGenerator(retval, memo)
+                return TypeCheckedAsyncGenerator(retval, memo, emit_warnings=emit_warnings)
 
         return retval
 
     async def async_wrapper(*args, **kwargs):
         memo = _CallMemo(python_func, args=args, kwargs=kwargs)
-        check_argument_types(memo)
+        check_argument_types(memo, emit_warnings=emit_warnings)
         retval = await func(*args, **kwargs)
-        check_return_type(retval, memo)
+        check_return_type(retval, memo, emit_warnings=emit_warnings)
         return retval
 
     if inspect.iscoroutinefunction(func):
@@ -782,7 +827,7 @@ class TypeWarning(UserWarning):
     """
     A warning that is emitted when a type check fails.
 
-    :ivar str event: ``call`` or ``return``
+    :ivar str event: ``call``, ``return`` or ``yield``
     :ivar Callable func: the function in which the violation occurred (the called function if event
         is ``call``, or the function where a value of the wrong type was returned from if event is
         ``return``)
@@ -800,12 +845,17 @@ class TypeWarning(UserWarning):
         self.frame = frame
 
         if self.event == 'call':
-            caller_frame = self.frame.f_back
-            event = 'call to {}() from {}:{}'.format(
-                function_name(self.func), caller_frame.f_code.co_filename, caller_frame.f_lineno)
-        else:
-            event = 'return from {}() at {}:{}'.format(
-                function_name(self.func), self.frame.f_code.co_filename, self.frame.f_lineno)
+            event = 'call to {}()'.format(function_name(self.func))
+            if frame:
+                caller_frame = self.frame.f_back
+                event += ' from {}:{}'.format(caller_frame.f_code.co_filename,
+                                              caller_frame.f_lineno)
+        elif self.event == 'return':
+            event = 'return from {}()'.format(function_name(self.func))
+            if frame:
+                event += ' at {}:{}'.format(self.frame.f_code.co_filename, self.frame.f_lineno)
+        elif self.event == 'yield':
+            event = 'yield from {}()'.format(function_name(self.func))
 
         super().__init__('[{thread_name}] {event}: {self.error}'.format(
             thread_name=threading.current_thread().name, event=event, self=self))
@@ -813,6 +863,9 @@ class TypeWarning(UserWarning):
     @property
     def stack(self):
         """Return the stack where the last frame is from the target function."""
+        if not self.frame:
+            raise RuntimeError('Stack frame not available')
+
         return extract_stack(self.frame)
 
     def print_stack(self, file: TextIO = None, limit: int = None) -> None:
@@ -823,6 +876,9 @@ class TypeWarning(UserWarning):
         :param limit: the maximum number of stack frames to print
 
         """
+        if not self.frame:
+            raise RuntimeError('Stack frame not available')
+
         print_stack(self.frame, limit, file)
 
 

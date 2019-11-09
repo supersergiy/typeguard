@@ -19,8 +19,9 @@ def optimized_cache_from_source(path, debug_override=None):
 
 
 class TypeguardTransformer(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, emit_warnings: bool) -> None:
         self._parents = []
+        self._emit_warnings = emit_warnings
 
     def visit_Module(self, node: ast.Module):
         # Insert "import typeguard" after any "from __future__ ..." imports
@@ -55,9 +56,15 @@ class TypeguardTransformer(ast.NodeVisitor):
         has_annotated_args = any(arg for arg in node.args.args if arg.annotation)
         has_annotated_return = bool(node.returns)
         if has_annotated_args or has_annotated_return:
+            # @typeguard.typechecked(emit_warnings=...)
             node.decorator_list.insert(
                 0,
-                ast.Attribute(ast.Name(id='typeguard', ctx=ast.Load()), 'typechecked', ast.Load())
+                ast.Call(
+                    ast.Attribute(
+                        ast.Name(id='typeguard', ctx=ast.Load()), 'typechecked', ast.Load()),
+                    [],
+                    [ast.keyword('emit_warnings', ast.NameConstant(value=self._emit_warnings))]
+                )
             )
 
         self._parents.append(node)
@@ -67,11 +74,15 @@ class TypeguardTransformer(ast.NodeVisitor):
 
 
 class TypeguardLoader(SourceFileLoader):
+    def __init__(self, fullname, path, *, emit_warnings: bool):
+        super().__init__(fullname, path)
+        self.emit_warnings = emit_warnings
+
     def source_to_code(self, data, path, *, _optimize=-1):
         source = decode_source(data)
         tree = _call_with_frames_removed(compile, source, path, 'exec', ast.PyCF_ONLY_AST,
                                          dont_inherit=True, optimize=_optimize)
-        tree = TypeguardTransformer().visit(tree)
+        tree = TypeguardTransformer(emit_warnings=self.emit_warnings).visit(tree)
         ast.fix_missing_locations(tree)
         return _call_with_frames_removed(compile, tree, path, 'exec',
                                          dont_inherit=True, optimize=_optimize)
@@ -96,12 +107,14 @@ class TypeguardFinder(MetaPathFinder):
     def __init__(self, packages, original_pathfinder):
         self._package_exprs = [re.compile(r'^%s\.?' % pkg) for pkg in packages]
         self._original_pathfinder = original_pathfinder
+        self.emit_warnings = False
 
     def find_spec(self, fullname, path=None, target=None):
         if self.should_instrument(fullname):
             spec = self._original_pathfinder.find_spec(fullname, path, target)
             if spec is not None and isinstance(spec.loader, SourceFileLoader):
-                spec.loader = TypeguardLoader(spec.loader.name, spec.loader.path)
+                spec.loader = TypeguardLoader(spec.loader.name, spec.loader.path,
+                                              emit_warnings=self.emit_warnings)
                 return spec
 
         return None
@@ -137,13 +150,15 @@ class ImportHookManager:
             pass  # already removed
 
 
-def install_import_hook(packages: Iterable[str], *,
+def install_import_hook(packages: Iterable[str], *, emit_warnings: bool = False,
                         cls: Type[TypeguardFinder] = TypeguardFinder) -> ImportHookManager:
     """
     Install an import hook that decorates classes and functions with ``@typechecked``.
 
     This only affects modules loaded **after** this hook has been installed.
 
+    :param emit_warnings: ``True`` to emit :exc:`~TypeWarning` instead of raising :exc:`~TypeError`
+        when a type violation is encountered
     :return: a context manager that uninstalls the hook on exit (or when you call ``.uninstall()``)
 
     .. versionadded:: 2.6
@@ -159,5 +174,8 @@ def install_import_hook(packages: Iterable[str], *,
         raise RuntimeError('Cannot find a PathFinder in sys.meta_path')
 
     hook = cls(packages, finder)
+    if hasattr(hook, 'emit_warnings'):
+        hook.emit_warnings = emit_warnings
+
     sys.meta_path.insert(0, hook)
     return ImportHookManager(hook)

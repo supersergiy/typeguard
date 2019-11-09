@@ -1,3 +1,4 @@
+import collections.abc
 import gc
 import sys
 import warnings

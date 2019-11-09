@@ -176,6 +176,9 @@ can do the following:
 
     pytest --typeguard-packages=foo.bar,xyz
 
+If you prefer to receive warnings instead of exceptions, you can pass use the
+``--typeguard-errors=warn`` option to ``pytest``.
+
 There is currently no support for specifying a customized module finder.
 
 Checking types directly
