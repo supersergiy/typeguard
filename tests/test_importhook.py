@@ -76,6 +76,27 @@ class TestImportHookWithTypeError:
             assert dummymodule.dynamic_type_checking_func(4, argtype, returntype) == '4'
 
 
+def test_class_in_function(dummymodule):
+    create_inner = dummymodule.outer()
+    retval = create_inner()
+    assert retval.__class__.__qualname__ == 'outer.<locals>.Inner'
+
+
+def test_inner_class_method(dummymodule):
+    retval = dummymodule.Outer().create_inner()
+    assert retval.__class__.__qualname__ == 'Outer.Inner'
+
+
+def test_inner_class_classmethod(dummymodule):
+    retval = dummymodule.Outer.create_inner_classmethod()
+    assert retval.__class__.__qualname__ == 'Outer.Inner'
+
+
+def test_inner_class_staticmethod(dummymodule):
+    retval = dummymodule.Outer.create_inner_staticmethod()
+    assert retval.__class__.__qualname__ == 'Outer.Inner'
+
+
 @pytest.mark.parametrize('dummymodule', [{'emit_warnings': True}], indirect=True)
 class TestImportHookWithTypeWarning:
     def test_type_checked_func_warning(self, dummymodule):

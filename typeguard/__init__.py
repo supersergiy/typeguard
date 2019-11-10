@@ -68,8 +68,9 @@ class _CallMemo:
     __slots__ = ('func', 'func_name', 'signature', 'typevars', 'arguments', 'type_hints',
                  'is_generator')
 
-    def __init__(self, func: Callable, frame=None, args: tuple = None,
-                 kwargs: Dict[str, Any] = None, forward_refs_policy=ForwardRefPolicy.ERROR):
+    def __init__(self, func: Callable, frame_locals: Optional[Dict[str, Any]] = None,
+                 args: tuple = None, kwargs: Dict[str, Any] = None,
+                 forward_refs_policy=ForwardRefPolicy.ERROR):
         self.func = func
         self.func_name = function_name(func)
         self.signature = inspect.signature(func)
@@ -79,14 +80,14 @@ class _CallMemo:
         if args is not None and kwargs is not None:
             self.arguments = self.signature.bind(*args, **kwargs).arguments
         else:
-            assert frame, 'frame must be specified if args or kwargs is None'
-            self.arguments = frame.f_locals.copy()
+            assert frame_locals is not None, 'frame must be specified if args or kwargs is None'
+            self.arguments = frame_locals
 
         self.type_hints = _type_hints_map.get(func)
         if self.type_hints is None:
             while True:
                 try:
-                    hints = get_type_hints(func)
+                    hints = get_type_hints(func, localns=frame_locals)
                 except NameError as exc:
                     if forward_refs_policy is ForwardRefPolicy.ERROR:
                         raise
@@ -575,7 +576,7 @@ def check_return_type(retval, memo: Optional[_CallMemo] = None,
         except LookupError:
             return True  # This can happen with the Pydev/PyCharm debugger extension installed
 
-        memo = _CallMemo(func, frame)
+        memo = _CallMemo(func, frame.f_locals)
 
     if 'return' in memo.type_hints:
         try:
@@ -612,7 +613,7 @@ def check_argument_types(memo: Optional[_CallMemo] = None, emit_warnings: bool =
         except LookupError:
             return True  # This can happen with the Pydev/PyCharm debugger extension installed
 
-        memo = _CallMemo(func, frame)
+        memo = _CallMemo(func, frame.f_locals)
 
     for argname, expected_type in memo.type_hints.items():
         if argname != 'return' and argname in memo.arguments:
@@ -746,7 +747,8 @@ def typechecked(func: T_CallableOrType, *, always: bool = False,
     ...
 
 
-def typechecked(func=None, *, always=False, emit_warnings=False):
+def typechecked(func=None, *, always=False, emit_warnings=False,
+                _localns: Optional[Dict[str, Any]] = None):
     """
     Perform runtime type checking on the arguments that are passed to the wrapped function.
 
@@ -768,18 +770,26 @@ def typechecked(func=None, *, always=False, emit_warnings=False):
         return func
 
     if func is None:
-        return partial(typechecked, always=always, emit_warnings=emit_warnings)
+        return partial(typechecked, always=always, emit_warnings=emit_warnings, _localns=_localns)
 
     if isclass(func):
         prefix = func.__qualname__ + '.'
-        for key in dir(func):
-            attr = getattr(func, key, None)
-            if callable(attr) and attr.__qualname__.startswith(prefix):
-                if getattr(attr, '__annotations__', None):
-                    setattr(func, key,
-                            typechecked(attr, always=always, emit_warnings=emit_warnings))
+        for key, attr in func.__dict__.items():
+            if inspect.isfunction(attr) or inspect.ismethod(attr) or inspect.isclass(attr):
+                if attr.__qualname__.startswith(prefix) and getattr(attr, '__annotations__', None):
+                    decorator = typechecked(attr, always=always, emit_warnings=emit_warnings,
+                                            _localns=func.__dict__)
+                    setattr(func, key, decorator)
+            elif isinstance(attr, (classmethod, staticmethod)):
+                wrapped = typechecked(attr.__func__, always=always, emit_warnings=emit_warnings,
+                                      _localns=func.__dict__)
+                setattr(func, key, type(attr)(wrapped))
 
         return func
+
+    # Find the frame in which the function was declared, for resolving forward references later
+    if _localns is None:
+        _localns = sys._getframe(1).f_locals
 
     # Find either the first Python wrapper or the actual function
     python_func = inspect.unwrap(func, stop=lambda f: hasattr(f, '__code__'))
@@ -789,7 +799,7 @@ def typechecked(func=None, *, always=False, emit_warnings=False):
         return func
 
     def wrapper(*args, **kwargs):
-        memo = _CallMemo(python_func, args=args, kwargs=kwargs)
+        memo = _CallMemo(python_func, _localns, args=args, kwargs=kwargs)
         check_argument_types(memo, emit_warnings=emit_warnings)
         retval = func(*args, **kwargs)
         check_return_type(retval, memo, emit_warnings=emit_warnings)
@@ -806,7 +816,7 @@ def typechecked(func=None, *, always=False, emit_warnings=False):
         return retval
 
     async def async_wrapper(*args, **kwargs):
-        memo = _CallMemo(python_func, args=args, kwargs=kwargs)
+        memo = _CallMemo(python_func, _localns, args=args, kwargs=kwargs)
         check_argument_types(memo, emit_warnings=emit_warnings)
         retval = await func(*args, **kwargs)
         check_return_type(retval, memo, emit_warnings=emit_warnings)
@@ -985,7 +995,7 @@ class TypeChecker:
 
             if func is not None and self.should_check_type(func):
                 memo = self._call_memos[frame] = _CallMemo(
-                    func, frame, forward_refs_policy=self.annotation_policy)
+                    func, frame.f_locals, forward_refs_policy=self.annotation_policy)
                 if memo.is_generator:
                     return_type_hint = memo.type_hints['return']
                     if return_type_hint is not None:

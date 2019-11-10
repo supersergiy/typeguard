@@ -974,6 +974,55 @@ class TestTypeChecked:
         cache_info = func.__wrapped__.cache_info()
         assert cache_info.hits == 1
 
+    def test_local_class(self):
+        @typechecked
+        class LocalClass:
+            class Inner:
+                pass
+
+            def create_inner(self) -> 'Inner':
+                return self.Inner()
+
+        retval = LocalClass().create_inner()
+        assert isinstance(retval, LocalClass.Inner)
+
+    def test_local_class_async(self):
+        @typechecked
+        class LocalClass:
+            class Inner:
+                pass
+
+            async def create_inner(self) -> 'Inner':
+                return self.Inner()
+
+        coro = LocalClass().create_inner()
+        exc = pytest.raises(StopIteration, coro.send, None)
+        retval = exc.value.value
+        assert isinstance(retval, LocalClass.Inner)
+
+    def test_callable_nonmember(self):
+        class CallableClass:
+            def __call__(self):
+                pass
+
+        @typechecked
+        class LocalClass:
+            some_callable = CallableClass()
+
+    def test_inherited_class_method(self):
+        @typechecked
+        class Parent:
+            @classmethod
+            def foo(cls, x: str) -> str:
+                return cls.__name__
+
+        @typechecked
+        class Child(Parent):
+            pass
+
+        assert Child.foo('bar') == 'Child'
+        pytest.raises(TypeError, Child.foo, 1)
+
 
 class TestTypeChecker:
     @pytest.fixture
