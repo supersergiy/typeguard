@@ -31,6 +31,13 @@ except ImportError:
     AsyncGenerator = None
 
 try:
+    from typing import ForwardRef
+    evaluate_forwardref = ForwardRef._evaluate
+except ImportError:
+    from typing import _ForwardRef as ForwardRef  # Python < 3.8
+    evaluate_forwardref = ForwardRef._eval_type
+
+try:
     from inspect import isasyncgenfunction, isasyncgen
 except ImportError:
     def isasyncgen(obj):
@@ -86,6 +93,9 @@ class _CallMemo:
         self.type_hints = _type_hints_map.get(func)
         if self.type_hints is None:
             while True:
+                if sys.version_info < (3, 5, 3):
+                    frame_locals = dict(frame_locals)
+
                 try:
                     hints = get_type_hints(func, localns=frame_locals)
                 except NameError as exc:
@@ -139,6 +149,13 @@ class _CallMemo:
             _type_hints_map[func] = self.type_hints
 
 
+def resolve_forwardref(maybe_ref, memo: _CallMemo):
+    if isinstance(maybe_ref, ForwardRef):
+        return evaluate_forwardref(maybe_ref, memo.func.__globals__, {})
+    else:
+        return maybe_ref
+
+
 def get_type_name(type_):
     # typing.* types don't have a __name__ on Python 3.7+
     return getattr(type_, '__name__', None) or type_._name
@@ -190,7 +207,7 @@ def qualified_name(obj) -> str:
     return qualname if module in ('typing', 'builtins') else '{}.{}'.format(module, qualname)
 
 
-def function_name(func: FunctionType) -> str:
+def function_name(func: Callable) -> str:
     """
     Return the qualified name of the given function.
 
@@ -198,8 +215,9 @@ def function_name(func: FunctionType) -> str:
     name stripped from the generated name.
 
     """
+    # For partial functions and objects with __call__ defined, __qualname__ does not exist
     module = func.__module__
-    qualname = func.__qualname__
+    qualname = getattr(func, '__qualname__', repr(func))
     return qualname if module == 'builtins' else '{}.{}'.format(module, qualname)
 
 
@@ -256,10 +274,13 @@ def check_dict(argname: str, value, expected_type, memo: Optional[_CallMemo]) ->
         raise TypeError('type of {} must be a dict; got {} instead'.
                         format(argname, qualified_name(value)))
 
-    key_type, value_type = getattr(expected_type, '__args__', expected_type.__parameters__)
-    for k, v in value.items():
-        check_type('keys of {}'.format(argname), k, key_type, memo)
-        check_type('{}[{!r}]'.format(argname, k), v, value_type, memo)
+    if expected_type is not dict:
+        if expected_type.__args__ not in (None, expected_type.__parameters__):
+            key_type, value_type = expected_type.__args__
+            if key_type is not Any or value_type is not Any:
+                for k, v in value.items():
+                    check_type('keys of {}'.format(argname), k, key_type, memo)
+                    check_type('{}[{!r}]'.format(argname, k), v, value_type, memo)
 
 
 def check_typed_dict(argname: str, value, expected_type, memo: Optional[_CallMemo]) -> None:
@@ -277,10 +298,12 @@ def check_list(argname: str, value, expected_type, memo: Optional[_CallMemo]) ->
         raise TypeError('type of {} must be a list; got {} instead'.
                         format(argname, qualified_name(value)))
 
-    value_type = getattr(expected_type, '__args__', expected_type.__parameters__)[0]
-    if value_type:
-        for i, v in enumerate(value):
-            check_type('{}[{}]'.format(argname, i), v, value_type, memo)
+    if expected_type is not list:
+        if expected_type.__args__ not in (None, expected_type.__parameters__):
+            value_type = expected_type.__args__[0]
+            if value_type is not Any:
+                for i, v in enumerate(value):
+                    check_type('{}[{}]'.format(argname, i), v, value_type, memo)
 
 
 def check_sequence(argname: str, value, expected_type, memo: Optional[_CallMemo]) -> None:
@@ -288,10 +311,11 @@ def check_sequence(argname: str, value, expected_type, memo: Optional[_CallMemo]
         raise TypeError('type of {} must be a sequence; got {} instead'.
                         format(argname, qualified_name(value)))
 
-    value_type = getattr(expected_type, '__args__', expected_type.__parameters__)[0]
-    if value_type:
-        for i, v in enumerate(value):
-            check_type('{}[{}]'.format(argname, i), v, value_type, memo)
+    if expected_type.__args__ not in (None, expected_type.__parameters__):
+        value_type = expected_type.__args__[0]
+        if value_type is not Any:
+            for i, v in enumerate(value):
+                check_type('{}[{}]'.format(argname, i), v, value_type, memo)
 
 
 def check_set(argname: str, value, expected_type, memo: Optional[_CallMemo]) -> None:
@@ -299,10 +323,12 @@ def check_set(argname: str, value, expected_type, memo: Optional[_CallMemo]) -> 
         raise TypeError('type of {} must be a set; got {} instead'.
                         format(argname, qualified_name(value)))
 
-    value_type = getattr(expected_type, '__args__', expected_type.__parameters__)[0]
-    if value_type:
-        for v in value:
-            check_type('elements of {}'.format(argname), v, value_type, memo)
+    if expected_type is not set:
+        if expected_type.__args__ not in (None, expected_type.__parameters__):
+            value_type = expected_type.__args__[0]
+            if value_type is not Any:
+                for v in value:
+                    check_type('elements of {}'.format(argname), v, value_type, memo)
 
 
 def check_tuple(argname: str, value, expected_type, memo: Optional[_CallMemo]) -> None:
@@ -393,17 +419,18 @@ def check_typevar(argname: str, value, typevar: TypeVar, memo: Optional[_CallMem
     if memo is None:
         raise TypeError('encountered a TypeVar but a call memo was not provided')
 
-    bound_type = memo.typevars.get(typevar, typevar.__bound__)
+    bound_type = resolve_forwardref(memo.typevars.get(typevar, typevar.__bound__), memo)
     value_type = value if subclass_check else type(value)
     subject = argname if subclass_check else 'type of ' + argname
     if bound_type is None:
         # The type variable hasn't been bound yet -- check that the given value matches the
         # constraints of the type variable, if any
-        if typevar.__constraints__ and value_type not in typevar.__constraints__:
-            typelist = ', '.join(get_type_name(t) for t in typevar.__constraints__
-                                 if t is not object)
-            raise TypeError('{} must be one of ({}); got {} instead'.
-                            format(subject, typelist, qualified_name(value_type)))
+        if typevar.__constraints__:
+            constraints = [resolve_forwardref(c, memo) for c in typevar.__constraints__]
+            if value_type not in constraints:
+                typelist = ', '.join(get_type_name(t) for t in constraints if t is not object)
+                raise TypeError('{} must be one of ({}); got {} instead'.
+                                format(subject, typelist, qualified_name(value_type)))
     elif typevar.__covariant__ or typevar.__bound__:
         if not issubclass(value_type, bound_type):
             raise TypeError(
@@ -781,9 +808,10 @@ def typechecked(func=None, *, always=False, emit_warnings=False,
                                             _localns=func.__dict__)
                     setattr(func, key, decorator)
             elif isinstance(attr, (classmethod, staticmethod)):
-                wrapped = typechecked(attr.__func__, always=always, emit_warnings=emit_warnings,
-                                      _localns=func.__dict__)
-                setattr(func, key, type(attr)(wrapped))
+                if getattr(attr.__func__, '__annotations__', None):
+                    wrapped = typechecked(attr.__func__, always=always,
+                                          emit_warnings=emit_warnings, _localns=func.__dict__)
+                    setattr(func, key, type(attr)(wrapped))
 
         return func
 

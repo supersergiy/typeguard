@@ -25,6 +25,10 @@ except ImportError:
     Collection = None
 
 
+TBound = TypeVar('TBound', bound='Parent')
+TConstrained = TypeVar('TConstrained', 'Parent', 'Child')
+
+
 class Parent:
     pass
 
@@ -725,6 +729,20 @@ class TestTypeChecked:
 
         foo({'x': 2})
 
+    @pytest.mark.parametrize('typehint, value', [
+        (Dict, {'x': 2, 6: 4}),
+        (List, ['x', 6]),
+        (Sequence, ['x', 6]),
+        (Set, {'x', 6}),
+        (Tuple, ('x', 6)),
+    ], ids=['dict', 'list', 'sequence', 'set', 'tuple'])
+    def test_unparametrized_types_mixed_values(self, typehint, value):
+        @typechecked
+        def foo(a: typehint):
+            pass
+
+        foo(value)
+
     @pytest.mark.parametrize('typehint', [
         Sequence[str],
         Sequence
@@ -1021,6 +1039,34 @@ class TestTypeChecked:
 
         assert Child.foo('bar') == 'Child'
         pytest.raises(TypeError, Child.foo, 1)
+
+    def test_decorator_factory_no_annotations(self):
+        class CallableClass:
+            def __call__(self):
+                pass
+
+        def decorator_factory():
+            def decorator(f):
+                cmd = CallableClass()
+                return cmd
+
+            return decorator
+
+        with pytest.warns(UserWarning):
+            @typechecked
+            @decorator_factory()
+            def foo():
+                pass
+
+    @pytest.mark.parametrize('annotation', [TBound, TConstrained], ids=['bound', 'constrained'])
+    def test_typevar_forwardref(self, annotation):
+        @typechecked
+        def func(x: annotation) -> None:
+            pass
+
+        func(Parent())
+        func(Child())
+        pytest.raises(TypeError, func, 'foo')
 
 
 class TestTypeChecker:
