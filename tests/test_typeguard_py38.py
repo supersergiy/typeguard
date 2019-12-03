@@ -14,15 +14,20 @@ def test_literal():
     pytest.raises(TypeError, foo, 4).match(r'must be one of \(1, 6, 8\); got 4 instead$')
 
 
-@pytest.mark.parametrize('value, error_re', [
-    ({'x': 6, 'y': 'foo'}, None),
-    ({'y': 'foo'}, None),
-    ({'y': 3}, 'type of dict item "y" for argument "arg" must be str; got int instead'),
-    ({}, 'the required key "y" is missing for argument "arg"')
-], ids=['correct', 'missing_x', 'wrong_type', 'missing_y'])
-def test_typed_dict(value, error_re):
-    class DummyDict(TypedDict):
-        x: int = 0
+@pytest.mark.parametrize('value, total, error_re', [
+    ({'x': 6, 'y': 'foo'}, True, None),
+    ({'y': 'foo'}, True, r'required key\(s\) \("x"\) missing from argument "arg"'),
+    ({'x': 6, 'y': 3}, True,
+     'type of dict item "y" for argument "arg" must be str; got int instead'),
+    ({'x': 6}, True, r'required key\(s\) \("y"\) missing from argument "arg"'),
+    ({'x': 6}, False, None),
+    ({'x': 'abc'}, False, 'type of dict item "x" for argument "arg" must be int; got str instead'),
+    ({'x': 6, 'foo': 'abc'}, False, r'extra key\(s\) \("foo"\) in argument "arg"'),
+], ids=['correct', 'missing_x', 'wrong_y', 'missing_y_error', 'missing_y_ok', 'wrong_x',
+        'unknown_key'])
+def test_typed_dict(value, total, error_re):
+    class DummyDict(TypedDict, total=total):
+        x: int
         y: str
 
     @typechecked

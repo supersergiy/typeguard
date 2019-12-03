@@ -9,14 +9,14 @@ import threading
 from collections import OrderedDict
 from enum import Enum
 from functools import wraps, partial
-from inspect import Parameter, isclass, isfunction, isgeneratorfunction
+from inspect import Parameter, isclass, isfunction, isgeneratorfunction, getattr_static
 from io import TextIOBase, RawIOBase, IOBase, BufferedIOBase
 from traceback import extract_stack, print_stack
 from types import CodeType, FunctionType
 from typing import (
     Callable, Any, Union, Dict, List, TypeVar, Tuple, Set, Sequence, get_type_hints, TextIO,
     Optional, IO, BinaryIO, Type, Generator, overload, Iterable, AsyncIterable, Iterator,
-    AsyncIterator)
+    AsyncIterator, AbstractSet)
 from warnings import warn
 from weakref import WeakKeyDictionary, WeakValueDictionary
 
@@ -24,6 +24,11 @@ try:
     from typing import Literal, TypedDict
 except ImportError:
     Literal = TypedDict = None
+
+try:
+    from typing import Protocol
+except ImportError:
+    from typing import _Protocol as Protocol
 
 try:
     from typing import AsyncGenerator
@@ -284,13 +289,24 @@ def check_dict(argname: str, value, expected_type, memo: Optional[_CallMemo]) ->
 
 
 def check_typed_dict(argname: str, value, expected_type, memo: Optional[_CallMemo]) -> None:
+    expected_keys = frozenset(expected_type.__annotations__)
+    existing_keys = frozenset(value)
+
+    extra_keys = existing_keys - expected_keys
+    if extra_keys:
+        keys_formatted = ', '.join('"{}"'.format(key) for key in sorted(extra_keys))
+        raise TypeError('extra key(s) ({}) in {}'.format(keys_formatted, argname))
+
+    if expected_type.__total__:
+        missing_keys = expected_keys - existing_keys
+        if missing_keys:
+            keys_formatted = ', '.join('"{}"'.format(key) for key in sorted(missing_keys))
+            raise TypeError('required key(s) ({}) missing from {}'.format(keys_formatted, argname))
+
     for key, argtype in expected_type.__annotations__.items():
         argvalue = value.get(key, _missing)
         if argvalue is not _missing:
             check_type('dict item "{}" for {}'.format(key, argname), argvalue, argtype)
-        elif not hasattr(expected_type, key):
-            raise TypeError('the required key "{}" is missing for {}'
-                            .format(key, argname)) from None
 
 
 def check_list(argname: str, value, expected_type, memo: Optional[_CallMemo]) -> None:
@@ -319,7 +335,7 @@ def check_sequence(argname: str, value, expected_type, memo: Optional[_CallMemo]
 
 
 def check_set(argname: str, value, expected_type, memo: Optional[_CallMemo]) -> None:
-    if not isinstance(value, collections.abc.Set):
+    if not isinstance(value, AbstractSet):
         raise TypeError('type of {} must be a set; got {} instead'.
                         format(argname, qualified_name(value)))
 
@@ -481,8 +497,15 @@ def check_io(argname: str, value, expected_type):
                         format(argname, qualified_name(value.__class__)))
 
 
+def check_protocol(argname: str, value, expected_type):
+    if not issubclass(type(value), expected_type):
+        raise TypeError('type of {} ({}) is not compatible with the {} protocol'.
+                        format(argname, type(value).__qualname__, expected_type.__qualname__))
+
+
 # Equality checks are applied to these
 origin_type_checkers = {
+    AbstractSet: check_set,
     Callable: check_callable,
     collections.abc.Callable: check_callable,
     dict: check_dict,
@@ -491,6 +514,7 @@ origin_type_checkers = {
     List: check_list,
     Sequence: check_sequence,
     collections.abc.Sequence: check_sequence,
+    collections.abc.Set: check_set,
     set: check_set,
     Set: check_set,
     tuple: check_tuple,
@@ -558,6 +582,8 @@ def check_type(argname: str, value, expected_type, memo: Optional[_CallMemo] = N
             check_io(argname, value, expected_type)
         elif issubclass(expected_type, dict) and hasattr(expected_type, '__annotations__'):
             check_typed_dict(argname, value, expected_type, memo)
+        elif getattr_static(expected_type, '_is_protocol', False):
+            check_protocol(argname, value, expected_type)
         else:
             expected_type = (getattr(expected_type, '__extra__', None) or origin_type or
                              expected_type)
